@@ -16,9 +16,11 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/tty.h>
+#include <linux/mutex.h>
 #include <linux/usb.h>
 #include <linux/usb/cdc.h>
 #include <linux/usb/serial.h>
+#include <linux/gpio/driver.h>
 
 struct xr_txrx_clk_mask {
 	u16 tx;
@@ -87,12 +89,14 @@ struct xr_txrx_clk_mask {
 #define XR_UART_FLOW_MODE_NONE		0x0
 #define XR_UART_FLOW_MODE_HW		0x1
 #define XR_UART_FLOW_MODE_SW		0x2
+#define XR_UART_FLOW_MULTIDROP		0x3
 
 #define XR_GPIO_MODE_SEL_MASK		GENMASK(2, 0)
 #define XR_GPIO_MODE_SEL_RTS_CTS	0x1
 #define XR_GPIO_MODE_SEL_DTR_DSR	0x2
 #define XR_GPIO_MODE_SEL_RS485		0x3
 #define XR_GPIO_MODE_SEL_RS485_ADDR	0x4
+#define XR_GPIO_MODE_RS485_POL		BIT(3)
 #define XR_GPIO_MODE_TX_TOGGLE		0x100
 #define XR_GPIO_MODE_RX_TOGGLE		0x200
 
@@ -111,6 +115,7 @@ struct xr_type {
 	u8 reg_recipient;
 	u8 set_reg;
 	u8 get_reg;
+	u8 ngpio;
 
 	u16 uart_enable;
 	u16 flow_control;
@@ -151,6 +156,7 @@ static const struct xr_type xr_types[] = {
 		.reg_recipient	= USB_RECIP_DEVICE,
 		.set_reg	= 0x00,
 		.get_reg	= 0x01,
+		.ngpio          = 6,
 
 		.uart_enable	= 0x03,
 		.flow_control	= 0x0c,
@@ -173,6 +179,7 @@ static const struct xr_type xr_types[] = {
 		.reg_recipient	= USB_RECIP_INTERFACE,
 		.set_reg	= 0x00,
 		.get_reg	= 0x00,
+		.ngpio          = 10,
 
 		.uart_enable	= 0x00,
 		.flow_control	= 0x06,
@@ -196,6 +203,7 @@ static const struct xr_type xr_types[] = {
 		.reg_recipient	= USB_RECIP_DEVICE,
 		.set_reg	= 0x00,
 		.get_reg	= 0x01,
+		.ngpio          = 6,
 
 		.uart_enable	= 0xc00,
 		.flow_control	= 0xc06,
@@ -216,6 +224,7 @@ static const struct xr_type xr_types[] = {
 		.reg_recipient	= USB_RECIP_DEVICE,
 		.set_reg	= 0x05,
 		.get_reg	= 0x05,
+		.ngpio          = 8,
 
 		.uart_enable	= 0x40,
 		.flow_control	= 0x46,
@@ -236,6 +245,16 @@ static const struct xr_type xr_types[] = {
 struct xr_data {
 	const struct xr_type *type;
 	u8 channel;			/* zero-based index or interface number */
+#if IS_ENABLED(CONFIG_GPIOLIB)
+	struct gpio_chip gc;
+	struct mutex gpio_lock;
+	bool gpio_registered;
+	bool gpio_used;
+	u16 gpio_altfunc;
+	u16 gpio_output;
+	u16 gpio_mask;
+	u16 gpio_value;
+#endif /* CONFIG_GPIOLIB */
 };
 
 static int xr_set_reg(struct usb_serial_port *port, u8 channel, u16 reg, u16 val)
@@ -466,6 +485,15 @@ static int xr_tiocmset_port(struct usb_serial_port *port,
 	u16 gpio_clr = 0;
 	int ret = 0;
 
+	if (IS_ENABLED(CONFIG_GPIOLIB)) {
+		mutex_lock(&data->gpio_lock);
+		if (data->gpio_output & (XR_GPIO_RTS | XR_GPIO_DTR)) {
+			mutex_unlock(&data->gpio_lock);
+			return -EBUSY;
+		}
+		data->gpio_altfunc |= XR_GPIO_RTS | XR_GPIO_DTR;
+	}
+
 	/* Modem control pins are active low, so set & clr are swapped */
 	if (set & TIOCM_RTS)
 		gpio_clr |= XR_GPIO_RTS;
@@ -482,6 +510,10 @@ static int xr_tiocmset_port(struct usb_serial_port *port,
 
 	if (gpio_set)
 		ret = xr_set_reg_uart(port, type->gpio_set, gpio_set);
+
+	if (IS_ENABLED(CONFIG_GPIOLIB)) {
+		mutex_unlock(&data->gpio_lock);
+	}
 
 	return ret;
 }
@@ -621,6 +653,25 @@ static int xr21v141x_set_baudrate(struct tty_struct *tty, struct usb_serial_port
 	return 0;
 }
 
+static void xr_enable_dtr_rts(struct usb_serial_port *const port)
+{
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	const struct xr_type *const type = data->type;
+
+	if (IS_ENABLED(CONFIG_GPIOLIB)) {
+		if (!(data->gpio_altfunc == (XR_GPIO_DTR | XR_GPIO_RTS))) {
+			data->gpio_output |= XR_GPIO_DTR | XR_GPIO_RTS;
+			(void)xr_set_reg_uart(port,
+				type->gpio_direction,
+				data->gpio_output);
+		}
+	} else {
+		(void)xr_set_reg_uart(port,
+			type->gpio_direction,
+			XR_GPIO_DTR | XR_GPIO_RTS);
+	}
+}
+
 static void xr_set_flow_mode(struct tty_struct *tty,
 			     struct usb_serial_port *port,
 			     struct ktermios *old_termios)
@@ -665,12 +716,32 @@ static void xr_set_flow_mode(struct tty_struct *tty,
 	xr_set_reg_uart(port, type->flow_control, flow);
 	xr_set_reg_uart(port, type->gpio_mode, gpio_mode);
 
+	if (IS_ENABLED(CONFIG_GPIOLIB)) {
+		switch (gpio_mode & XR_GPIO_MODE_SEL_MASK) {
+		case XR_GPIO_MODE_SEL_RTS_CTS:
+			data->gpio_altfunc = XR_GPIO_CTS | XR_GPIO_RTS;
+			break;
+		case XR_GPIO_MODE_SEL_DTR_DSR:
+			data->gpio_altfunc = XR_GPIO_DSR | XR_GPIO_DTR;
+			break;
+		case XR_GPIO_MODE_SEL_RS485:
+			fallthrough;
+		case XR_GPIO_MODE_SEL_RS485_ADDR:
+			data->gpio_altfunc = XR_GPIO_RTS;
+			break;
+		}
+	}
+
 	xr_uart_enable(port);
 
-	if (C_BAUD(tty) == B0)
+	if (C_BAUD(tty) == B0) {
 		xr_dtr_rts(port, 0);
-	else if (old_termios && (old_termios->c_cflag & CBAUD) == B0)
+		xr_enable_dtr_rts(port);
+	}
+	else if (old_termios && (old_termios->c_cflag & CBAUD) == B0) {
 		xr_dtr_rts(port, 1);
+		xr_enable_dtr_rts(port);
+	}
 }
 
 static void xr21v141x_set_line_settings(struct tty_struct *tty,
@@ -889,37 +960,8 @@ static int xr_probe(struct usb_serial *serial, const struct usb_device_id *id)
 	return 0;
 }
 
-static int xr_gpio_init(struct usb_serial_port *port, const struct xr_type *type)
-{
-	u16 mask, mode;
-	int ret;
-
-	/*
-	 * Configure all pins as GPIO except for Receive and Transmit Toggle.
-	 */
-	mode = 0;
-	if (type->have_xmit_toggle)
-		mode |= XR_GPIO_MODE_RX_TOGGLE | XR_GPIO_MODE_TX_TOGGLE;
-
-	ret = xr_set_reg_uart(port, type->gpio_mode, mode);
-	if (ret)
-		return ret;
-
-	/*
-	 * Configure DTR and RTS as outputs and make sure they are deasserted
-	 * (active low), and configure RI, CD, DSR and CTS as inputs.
-	 */
-	mask = XR_GPIO_DTR | XR_GPIO_RTS;
-	ret = xr_set_reg_uart(port, type->gpio_direction, mask);
-	if (ret)
-		return ret;
-
-	ret = xr_set_reg_uart(port, type->gpio_set, mask);
-	if (ret)
-		return ret;
-
-	return 0;
-}
+static int xr_gpio_init(struct usb_serial_port * const port,
+	const struct xr_type * type);
 
 static int xr_port_probe(struct usb_serial_port *port)
 {
@@ -965,11 +1007,362 @@ err_free:
 	return ret;
 }
 
+static void xr_gpio_remove(struct usb_serial_port * const port);
+
 static void xr_port_remove(struct usb_serial_port *port)
 {
 	struct xr_data *data = usb_get_serial_port_data(port);
 
+	xr_gpio_remove(port);
 	kfree(data);
+}
+
+#if IS_ENABLED(CONFIG_GPIOLIB)
+
+static int xr_gpio_request(struct gpio_chip *gc, unsigned int offset)
+{
+	struct usb_serial_port * const port = gpiochip_get_data(gc);
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	unsigned long map;
+
+	mutex_lock(&data->gpio_lock);
+	map = data->gpio_altfunc;
+	if (test_bit(offset, &map)) {
+		mutex_unlock(&data->gpio_lock);
+		return -EBUSY;
+	}
+	mutex_unlock(&data->gpio_lock);
+
+	return 0;
+}
+
+static void xr_gpio_free(struct gpio_chip *gc, unsigned int offset)
+{
+	struct usb_serial_port * const port = gpiochip_get_data(gc);
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	unsigned long output;
+
+	mutex_lock(&data->gpio_lock);
+	output = data->gpio_output;
+	if (__test_and_clear_bit(offset, &output)) {
+		(void)xr_set_reg_uart(port, data->type->gpio_direction, output);
+		data->gpio_output = output;
+	}
+	mutex_unlock(&data->gpio_lock);
+}
+
+static int xr_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
+{
+	struct usb_serial_port * const port = gpiochip_get_data(gc);
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	unsigned long tmp = data->gpio_output;
+
+	return test_bit(offset, &tmp) ?
+		GPIO_LINE_DIRECTION_OUT : GPIO_LINE_DIRECTION_IN;
+}
+
+static int xr_gpio_direction_input(struct gpio_chip *gc, unsigned int offset)
+{
+	struct usb_serial_port * const port = gpiochip_get_data(gc);
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	unsigned long output;
+	int ret;
+
+	mutex_lock(&data->gpio_lock);
+	output = data->gpio_output;
+	if (__test_and_clear_bit(offset, &output)) {
+		ret = xr_set_reg_uart(port, data->type->gpio_direction, output);
+		if (ret) {
+			mutex_unlock(&data->gpio_lock);
+			return ret;
+		}
+		data->gpio_output = output;
+	}
+	mutex_unlock(&data->gpio_lock);
+
+	return 0;
+}
+
+static int xr_gpio_direction_output(struct gpio_chip *gc,
+					unsigned int offset, int value)
+{
+	struct usb_serial_port * const port = gpiochip_get_data(gc);
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	const struct xr_type * const type = data->type;
+	unsigned long tmp, output;
+	int ret;
+
+	mutex_lock(&data->gpio_lock);
+	output = data->gpio_output;
+	__set_bit(offset, &output);
+	tmp = data->gpio_value;
+
+	if (value) {
+		if (!__test_and_set_bit(offset, &tmp)) {
+			ret = xr_set_reg_uart(port, type->gpio_set, tmp);
+			if (ret) {
+				mutex_unlock(&data->gpio_lock);
+				return ret;
+			}
+		}
+	} else {
+		if (__test_and_clear_bit(offset, &tmp)) {
+			ret = xr_set_reg_uart(port, type->gpio_clear,
+				output & ~tmp);
+			if (ret) {
+				mutex_unlock(&data->gpio_lock);
+				return ret;
+			}
+		}
+	}
+	data->gpio_value = tmp;
+
+	ret = xr_set_reg_uart(port, type->gpio_direction, output);
+	if (ret) {
+		mutex_unlock(&data->gpio_lock);
+		return ret;
+	}
+	data->gpio_output = output;
+	mutex_unlock(&data->gpio_lock);
+
+	return 0;
+}
+
+static int xr_gpio_get(struct gpio_chip *gc, unsigned int offset)
+{
+	struct usb_serial_port * const port = gpiochip_get_data(gc);
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	u16 value;
+	unsigned long tmp;
+	int ret;
+
+	ret = xr_get_reg_uart(port, data->type->gpio_status, &value);
+	if (ret)
+		return ret;
+
+	tmp = value;
+	return test_bit(offset, &tmp);
+}
+
+static int xr_gpio_get_multiple(struct gpio_chip *gc,
+					unsigned long *mask,
+					unsigned long *bits)
+{
+	struct usb_serial_port * const port = gpiochip_get_data(gc);
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	u16 value;
+	int ret;
+
+	ret = xr_get_reg_uart(port, data->type->gpio_status, &value);
+	if (ret)
+		return ret;
+
+	*bits = value & *mask;
+
+	return 0;
+}
+
+static int xr_gpio_init_valid_mask(struct gpio_chip *gc,
+					unsigned long *valid_mask,
+					unsigned int ngpios)
+{
+	struct usb_serial_port * const port = gpiochip_get_data(gc);
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	unsigned long map = data->gpio_altfunc;
+
+	bitmap_complement(valid_mask, &map, ngpios);
+
+	return 0;
+}
+
+static void xr_gpio_remove(struct usb_serial_port * const port)
+{
+	struct xr_data * const data = usb_get_serial_port_data(port);
+
+	if (data->gpio_registered) {
+		gpiochip_remove(&data->gc);
+		data->gpio_registered = false;
+	}
+}
+
+static void xr_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
+{
+	struct usb_serial_port * const port = gpiochip_get_data(gc);
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	const struct xr_type * const type = data->type;
+	unsigned long tmp;
+
+	mutex_lock(&data->gpio_lock);
+	tmp = data->gpio_value;
+	__assign_bit(offset, &tmp, value);
+	if (value)
+		(void)xr_set_reg_uart(port, type->gpio_set,
+			data->gpio_output & tmp);
+	else
+		(void)xr_set_reg_uart(port, type->gpio_clear,
+			data->gpio_output & ~tmp);
+
+	data->gpio_value = tmp;
+	mutex_unlock(&data->gpio_lock);
+}
+
+static void xr_gpio_set_multiple(struct gpio_chip *gc,
+					unsigned long *mask,
+					unsigned long *bits)
+{
+	struct usb_serial_port * const port = gpiochip_get_data(gc);
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	const struct xr_type * const type = data->type;
+	unsigned long value;
+	unsigned long tmp;
+
+	mutex_lock(&data->gpio_lock);
+	value = data->gpio_value;
+	bitmap_replace(&tmp, &value, bits, mask, 16);
+	if (tmp)
+		(void)xr_set_reg_uart(port, type->gpio_set,
+			data->gpio_output & tmp);
+
+	if (~tmp)
+		(void)xr_set_reg_uart(port, type->gpio_clear,
+			data->gpio_output & ~tmp);
+
+	data->gpio_value = tmp;
+	mutex_unlock(&data->gpio_lock);
+}
+
+static int xr_gpio_init(struct usb_serial_port * const port,
+	const struct xr_type * type)
+{
+	struct xr_data * const data = usb_get_serial_port_data(port);
+	int ret;
+
+	mutex_init(&data->gpio_lock);
+
+	data->gc.label = "xr_gpio";
+	data->gc.parent = &port->dev;
+	data->gc.owner = THIS_MODULE;
+	data->gc.request = xr_gpio_request;
+	data->gc.free = xr_gpio_free;
+	data->gc.get_direction = xr_gpio_get_direction;
+	data->gc.direction_input = xr_gpio_direction_input;
+	data->gc.direction_output = xr_gpio_direction_output;
+	data->gc.get = xr_gpio_get;
+	data->gc.get_multiple = xr_gpio_get_multiple;
+	data->gc.set = xr_gpio_set;
+	data->gc.set_multiple = xr_gpio_set_multiple;
+	data->gc.init_valid_mask = xr_gpio_init_valid_mask;
+	data->gc.base = -1;
+	data->gc.ngpio = type->ngpio;
+	data->gc.can_sleep = true;
+
+	/* configre all GPIOs as inputs */
+	ret = xr_set_reg_uart(port, type->gpio_direction, 0);
+	if (ret) {
+		return ret;
+	}
+	/* enable all pins for GPIO */
+	ret = xr_set_reg_uart(port, type->gpio_mode, 0);
+	if (ret) {
+		return ret;
+	}
+
+	ret = gpiochip_add_data(&data->gc, port);
+	if (!ret)
+		data->gpio_registered = true;
+
+	return ret;
+}
+
+#else
+
+static int xr_gpio_init(struct usb_serialport * const port,
+		const struct xr_type * const type)
+{
+	return 0;
+}
+
+static void xr_gpio_remove(struct usb_serial_port * const port) { }
+
+#endif /* CONFIG_GPIOLIB */
+
+
+static int xr_rs485_configure(struct usb_serial_port * const port,
+	void __user * const argp)
+{
+	struct  xr_data * const data = usb_get_serial_port_data(port);
+	const struct xr_type * const type = data->type;
+	struct serial_rs485 rs485;
+	int ret;
+
+	if (copy_from_user(&rs485, argp, sizeof(rs485))) {
+		return -EFAULT;
+	}
+	if (IS_ENABLED(CONFIG_GPIOLIB))
+		mutex_lock(&data->gpio_lock);
+
+	if (rs485.flags & SER_RS485_ENABLED) {
+		if (IS_ENABLED(CONFIG_GPIOLIB)) {
+			if (data->gpio_output & XR_GPIO_RTS) {
+				mutex_unlock(&data->gpio_lock);
+				return -EBUSY;
+			}
+			data->gpio_altfunc |= XR_GPIO_RTS;
+		}
+		ret = xr_set_reg_uart(port, type->flow_control,
+			XR_UART_FLOW_MULTIDROP);
+		if (ret)
+			goto err_out;
+
+		ret = xr_set_reg_uart(port,
+			type->gpio_mode,
+			(rs485.flags & SER_RS485_RTS_ON_SEND) ?
+			XR_GPIO_MODE_SEL_RS485 | XR_GPIO_MODE_RS485_POL :
+			XR_GPIO_MODE_SEL_RS485);
+		if (ret)
+			goto err_out;
+
+		if (IS_ENABLED(CONFIG_GPIOLIB))
+			mutex_unlock(&data->gpio_lock);
+	} else {
+		ret = xr_set_reg_uart(port, type->flow_control,
+			XR_UART_FLOW_MODE_NONE);
+		if (ret)
+			goto err_out;
+
+		ret = xr_set_reg_uart(port, type->gpio_mode, 0);
+		if (ret)
+			goto err_out;
+
+		if (IS_ENABLED(CONFIG_GPIOLIB))
+			data->gpio_altfunc &= ~XR_GPIO_RTS;
+	}
+
+	if (IS_ENABLED(CONFIG_GPIOLIB))
+		mutex_unlock(&data->gpio_lock);
+
+	return 0;
+err_out:
+	if (IS_ENABLED(CONFIG_GPIOLIB))
+		mutex_unlock(&data->gpio_lock);
+
+	return ret;
+}
+
+
+static int xr_ioctl(struct tty_struct *tty, unsigned int cmd, unsigned long arg)
+{
+	struct usb_serial_port * const port = tty->driver_data;
+	void __user * const argp = (void __user*)arg;
+
+	switch (cmd) {
+	case TIOCSRS485:
+		return xr_rs485_configure(port, argp);
+	default:
+		break;
+	}
+
+	return -ENOIOCTLCMD;
 }
 
 #define XR_DEVICE(vid, pid, type)					\
@@ -1008,7 +1401,8 @@ static struct usb_serial_driver xr_device = {
 	.set_termios		= xr_set_termios,
 	.tiocmget		= xr_tiocmget,
 	.tiocmset		= xr_tiocmset,
-	.dtr_rts		= xr_dtr_rts
+	.dtr_rts		= xr_dtr_rts,
+	.ioctl			= xr_ioctl,
 };
 
 static struct usb_serial_driver * const serial_drivers[] = {
