@@ -593,13 +593,13 @@ static int xr21v141x_set_baudrate(struct tty_struct *tty, struct usb_serial_port
 	u16 tx_mask, rx_mask;
 	int ret;
 
-	baud = tty->termios.c_ospeed;
+	baud = tty_get_baud_rate(tty);
 	if (!baud)
 		return 0;
 
 	baud = clamp(baud, XR21V141X_MIN_SPEED, XR21V141X_MAX_SPEED);
 	divisor = XR_INT_OSC_HZ / baud;
-	idx = ((32 * XR_INT_OSC_HZ) / baud) & 0x1f;
+	idx = ((32 * XR_INT_OSC_HZ) / baud) - (32 * divisor);
 	tx_mask = xr21v141x_txrx_clk_masks[idx].tx;
 
 	if (divisor & 0x01)
@@ -751,7 +751,7 @@ static void xr21v141x_set_line_settings(struct tty_struct *tty,
 	u8 bits = 0;
 	int ret;
 
-	if (!old_termios || (tty->termios.c_ospeed != old_termios->c_ospeed))
+	if (!old_termios || tty_get_baud_rate(tty) != tty_termios_baud_rate(old_termios))
 		xr21v141x_set_baudrate(tty, port);
 
 	switch (C_CSIZE(tty)) {
@@ -815,10 +815,10 @@ static void xr_cdc_set_line_coding(struct tty_struct *tty,
 	if (!lc)
 		return;
 
-	if (tty->termios.c_ospeed)
-		lc->dwDTERate = cpu_to_le32(tty->termios.c_ospeed);
+	if (tty_get_baud_rate(tty))
+		lc->dwDTERate = cpu_to_le32(tty_get_baud_rate(tty));
 	else if (old_termios)
-		lc->dwDTERate = cpu_to_le32(old_termios->c_ospeed);
+		lc->dwDTERate = cpu_to_le32(tty_termios_baud_rate(old_termios));
 	else
 		lc->dwDTERate = cpu_to_le32(9600);
 
