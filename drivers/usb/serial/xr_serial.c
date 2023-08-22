@@ -90,6 +90,7 @@ struct xr_txrx_clk_mask {
 #define XR_UART_FLOW_MODE_HW		0x1
 #define XR_UART_FLOW_MODE_SW		0x2
 #define XR_UART_FLOW_MULTIDROP		0x3
+#define XR_UART_FLOW_HALF_DUPLEX	BIT(3)
 
 #define XR_GPIO_MODE_SEL_MASK		GENMASK(2, 0)
 #define XR_GPIO_MODE_SEL_RTS_CTS	0x1
@@ -1309,8 +1310,7 @@ static int xr_rs485_configure(struct usb_serial_port * const port,
 			}
 			data->gpio_altfunc |= XR_GPIO_RTS;
 		}
-		ret = xr_set_reg_uart(port, type->flow_control,
-			XR_UART_FLOW_MULTIDROP);
+		ret = xr_set_reg_uart(port, type->flow_control, XR_UART_FLOW_HALF_DUPLEX);
 		if (ret)
 			goto err_out;
 
